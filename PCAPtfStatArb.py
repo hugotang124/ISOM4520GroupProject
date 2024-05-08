@@ -45,7 +45,7 @@ class PCAPtfStatArb:
             os.mkdir(folder)
         
         holder = {}
-        data_tickers = self.tickers
+        data_tickers = self.tickers.copy()
         if self.benchmark_sym not in self.tickers:
             data_tickers += [self.benchmark_sym]
       
@@ -82,8 +82,8 @@ class PCAPtfStatArb:
     
     def calculate_beta(self):
         self.beta_df = pd.DataFrame() 
-        self.beta_df = self.return_df.rolling(22, axis = 0).cov(self.benchmark_returns) / self.return_df.rolling(22, axis = 0).var()
-        # Beta calculation based on the previous close when opening the position
+        for stock in self.return_df.columns:
+            self.beta_df[stock] = self.return_df[stock].rolling(22).cov(self.benchmark_returns) / self.benchmark_returns.rolling(22).var()
         self.beta_df.shift(1)
 
 
@@ -328,23 +328,33 @@ class PCAPtfStatArb:
     def optimize(self):
         max_pos_poss = list(range(1, 6))
         min_points_poss = list(range(10, 252, 10))
-        all_possibilities = self.cartesian([max_pos_poss, min_points_poss])
+        beta_hedge_choices = [True, False]
+
+        optim_columns = ["max_pos", "min_points", "hedge_choice"]
+        all_possibilities = self.cartesian([max_pos_poss, min_points_poss, beta_hedge_choices])
         test_results = []
         
-        for max_pos, min_point in tqdm.tqdm(all_possibilities):
-            end_cash_value, final_df, orders = self.simulation(max_pos, min_point, True)
+        for max_pos, min_point, hedge_choice in tqdm.tqdm(all_possibilities):
+            end_cash_value, final_df, orders = self.simulation(max_pos, min_point, hedge_choice)
             final_df, statistics = self.backtest_statistics(final_df)
             statistics = pd.DataFrame.from_dict(statistics, orient = "index").T
             test_results.append(statistics)
         
         optim_res = pd.concat(test_results)
-        optim_res[["max_pos", "min_points"]] = all_possibilities
-        optim_res['backtest_name'] = "Case_" + optim_res["max_pos"] + optim_res["min_points"]
+        optim_res[optim_columns] = all_possibilities
+        optim_res['backtest_name'] = optim_res.apply(lambda x: f"Case_{int(x.max_pos)}_{int(x.min_point)}_{x.hedge_choice}", axis = 1)
+        optim_res.set_index("backtest_name", inplace = True)
         optim_res.sort_values(by = "ptf_return", inplace = True)
-        return optim_res
+        return optim_res.drop(column = optim_columns)
     
     def run_optimize(self):
-        pass
+        optim_res = self.optimize()
+        optim_res.to_csv("OptimizationResults.csv", index = True)
+        from tabulate import tabulate
+        print(tabulate(optim_res))
+
+
+        
         
 
 
@@ -352,7 +362,4 @@ if __name__ == "__main__":
     start_date = datetime(2022, 1, 1)
     end_date = datetime(2024, 1, 1)
     algo = PCAPtfStatArb(SPY_SECTOR_ETF, start_date, end_date)
-
-    max_position = 3
-    min_data_points = 170
-    algo.run_simulation(max_position, min_data_points, True)
+    algo.run_optimize()
