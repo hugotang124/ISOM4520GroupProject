@@ -25,7 +25,10 @@ import tqdm
 
 
 SPY_SECTOR_ETF = ["XLC", "XLY", "XLP", "XLE", "XLF", "XLV", "XLI", "XLB", "XLRE", "XLK", "XLU"]
-BACKTEST_TABLE_FIELDS = ["Test Name", "Portfolio Return (%)", "Average Return (%)", "Volatility (%)", "VaR (%)", "MDD(%)","Alpha (%)", "Beta", "Sharpe Ratio"]
+BACKTEST_TABLE_FIELDS = ["Test Name", "Portfolio Return (%)", "Average Return (%)",
+                         "Volatility (%)", "VaR (%)", "MDD(%)",
+                         "Win Rate (%)", "Long Win Rate (%)", "Short Win Rate (%)",
+                         "Alpha (%)", "Beta", "Sharpe Ratio"]
 
 class PCAPtfStatArb:
     
@@ -112,7 +115,7 @@ class PCAPtfStatArb:
         orders = {}
         slippage = 0.00025
         commission_fee = 0.005
-        beta_limit = 0
+        beta_limit = 0.2
     
     
         if max_position >= self.close_df.shape[1] / 2:
@@ -128,7 +131,7 @@ class PCAPtfStatArb:
             daily_pnl = 0
             for stock, position_info in entry.items():
                 price, size = position_info.values()
-                if stock != "hedge":
+                if stock != self.benchmark_sym:
                     stock_col = self.tickers.index(stock)
                     trade_pnl = (price - self.close_df.iloc[i - 1, stock_col]) * size
                 else:
@@ -157,7 +160,7 @@ class PCAPtfStatArb:
             residuals = self.get_residuals(section_data, 1)
             residuals = np.stack(residuals, axis = 0)
             z_scores = self.z_score(residuals)
-            zs = dict(enumerate(z_scores[-1, :], 1))
+            zs = dict(enumerate(z_scores[-1, :], 2))
     
     
             # Opening the position according to open price of current time
@@ -181,7 +184,7 @@ class PCAPtfStatArb:
                 abs_difference = abs(beta) - beta_limit
                 hedge_direction = -1 if beta > 0 else 1
                 entry_price = self.benchmark_data.Open[i] * (1 + slippage) if hedge_direction > 0 else self.benchmark_data.Open[i] * (1 - slippage)
-                entry["hedge"] = {"price": entry_price, "size": np.round(abs_difference * cash_value / entry_price) * hedge_direction}
+                entry[self.benchmark_sym] = {"price": entry_price, "size": np.round(abs_difference * cash_value / entry_price) * hedge_direction}
                 beta += abs_difference * hedge_direction
             
             betas.append(beta)
@@ -210,11 +213,15 @@ class PCAPtfStatArb:
     
         return cash_value, df, orders        
     
-    def store_results(self, df, orders):
+    def store_results(self, df, orders, table):
 
         result_storage = "BacktestResults"
         if not os.path.exists(result_storage):
             os.mkdir(result_storage)
+        
+        summary = os.path.join(result_storage, "summary.txt")
+        with open(summary, "w") as f:
+            f.write(table.get_string())
         
         orders_json = os.path.join(result_storage, "orders.json")
         with open(orders_json, "w") as f:
@@ -224,7 +231,7 @@ class PCAPtfStatArb:
         df.to_csv(simulation_csv, index = True)
 
     
-    def plot_graphs(self, df, orders):
+    def plot_graphs(self, df):
         
         graph_storage = "Graphs"
         if not os.path.exists(graph_storage):
@@ -236,8 +243,6 @@ class PCAPtfStatArb:
         plt.plot(df.benchmark_val, label = "Benchmark")
         plt.legend()
         equity_curve.savefig(os.path.join(graph_storage, "EquityCurveVSBenchmark.png"))
-
-
 
         # Portfolio Beta
         beta_curve = plt.figure(figsize = (8, 8))
@@ -256,8 +261,7 @@ class PCAPtfStatArb:
         plt.savefig(os.path.join(graph_storage, "PortfolioMDDGraph.png"))
 
 
-
-    def backtest_statistics(self, df):
+    def backtest_statistics(self, df, orders):
 
         df_b = df.copy().dropna()
 
@@ -279,12 +283,32 @@ class PCAPtfStatArb:
 
         max_drawdown = -df_b.max_drawdown.min()
 
+        orders_df  = pd.DataFrame.from_dict({(i,j): orders[i][j] 
+                           for i in orders.keys() 
+                           for j in orders[i].keys()},
+                       orient='index')
+        orders_df.index = orders_df.index.set_names(["time", "symbol"])
+        orders_df.reset_index(inplace = True)
+    
+        orders_df['direction'] = np.where(orders_df['size'] > 0, 1, -1)
+        orders_df['size'] = np.abs(orders_df['size'])
+        orders_df["order_return"] = orders_df.pnl / (orders_df.price * orders_df.size * orders_df.direction)
+        orders_df = orders_df[orders_df.symbol != "SPY"]
+        win_rate = orders_df[orders_df.order_return > 0].shape[0] / orders_df.shape[0]
+        long_orders = orders_df[orders_df.direction == 1]
+        long_win_rate = long_orders[long_orders.order_return > 0].shape[0] / long_orders.shape[0]
+        short_orders = orders_df[orders_df.direction == -1]
+        short_win_rate = short_orders[short_orders.order_return > 0].shape[0] / short_orders.shape[0]
+
         statistics = {
             "ptf_return": ptf_return,
             "avg_return": avg_return,
             "volatility": volatility,
             "var": VaR_percentage,
             "maxdrawdown": max_drawdown,
+            "win_rate": win_rate,
+            "long_win_rate": long_win_rate,
+            "short_win_rate": short_win_rate,
             "alpha": alpha,
             "beta": beta,
             "sharpe": sharpe
@@ -297,19 +321,17 @@ class PCAPtfStatArb:
         table.field_names = fields
         return table
     
-    
     def run_simulation(self, max_pos, min_datapoints, beta_hedge = False):
         end_cash_value, df, orders = self.simulation(max_pos, min_datapoints, beta_hedge)
-        df, statistics = self.backtest_statistics(df)
+        df, statistics = self.backtest_statistics(df, orders)
         table = self.create_table(BACKTEST_TABLE_FIELDS)
         statistics = np.array(list(statistics.values()))
         statistics[:-2] *= 100
         statistics = np.round(statistics, 3)
         table.add_row(["Backtest"] + list(statistics))
-        print(table)
 
-        self.plot_graphs(df, orders)
-        self.store_results(df, orders)
+        self.plot_graphs(df)
+        self.store_results(df, orders, table)
 
     def cartesian(self, arrays, out = None):
         arrays = [np.asarray(x) for x in arrays]
@@ -329,13 +351,8 @@ class PCAPtfStatArb:
         return out
     
     # Grid Search Optimization
-    def optimize(self):
-        max_pos_poss = list(range(1, 6))
-        min_points_poss = list(range(10, 252, 10))
-        beta_hedge_choices = [True, False]
-
-        optim_columns = ["max_pos", "min_points", "hedge_choice"]
-        all_possibilities = self.cartesian([max_pos_poss, min_points_poss, beta_hedge_choices])
+    def optimize(self, arrays, optim_columns):
+        all_possibilities = self.cartesian(arrays)
         test_results = []
         
         for max_pos, min_point, hedge_choice in tqdm.tqdm(all_possibilities):
@@ -346,18 +363,23 @@ class PCAPtfStatArb:
         
         optim_res = pd.concat(test_results)
         optim_res[optim_columns] = all_possibilities
-        optim_res['backtest_name'] = optim_res.apply(lambda x: f"Case_{int(x.max_pos)}_{int(x.min_points)}_{x.hedge_choice}", axis = 1)
+        optim_res['backtest_name'] = optim_res.apply(lambda x: "Case_" + "_".join([str(int(x[column])) for column in optim_columns]), axis = 1)
         optim_res.set_index("backtest_name", inplace = True)
-        optim_res.sort_values(by = "ptf_return", ascending = False, inplace = True)
+        optim_res.sort_values(by = "sharpe", ascending = False, inplace = True)
         return optim_res.drop(columns = optim_columns)
     
     def run_optimize(self):
-        optim_res = self.optimize()
-        optim_res.to_csv("OptimizationResults.csv", index = True)
+        max_pos_poss = list(range(1, 6))
+        min_points_poss = list(range(10, 252, 10))
+        beta_hedge_choices = [True, False]
+        optim_columns = ["max_pos", "min_points", "hedge_choice"]
+        optim_arrays = [max_pos_poss, min_points_poss, beta_hedge_choices]
+
+        optim_res = self.optimize(optim_arrays, optim_columns)
+        # optim_res.to_csv("OptimizationResults.csv", index = True)
+        best_params = optim_res.index[0].split("_")[1:]
         from tabulate import tabulate
-        print(tabulate(optim_res))
-
-
+        print(tabulate(optim_res, headers = optim_res.columns))
 
 
 if __name__ == "__main__":
