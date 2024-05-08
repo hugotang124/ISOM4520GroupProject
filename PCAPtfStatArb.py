@@ -8,7 +8,7 @@ import yfinance as yf
 from datetime import datetime, timedelta
 import os
 from pytz import timezone
-from pandas.tseries.offsets import BDay
+import argparse
 import warnings
 warnings.simplefilter(action = "ignore", category = FutureWarning)
 
@@ -129,7 +129,8 @@ class PCAPtfStatArb:
             for stock, position_info in entry.items():
                 price, size = position_info.values()
                 if stock != "hedge":
-                    trade_pnl = (price - self.close_df.iloc[i - 1, stock]) * size
+                    stock_col = self.tickers.index(stock)
+                    trade_pnl = (price - self.close_df.iloc[i - 1, stock_col]) * size
                 else:
                     trade_pnl = (price - self.benchmark_data.Close[i - 1]) * size
                 
@@ -140,9 +141,12 @@ class PCAPtfStatArb:
             cash_value += daily_pnl
             pnls.append(daily_pnl)
     
-            orders[self.close_df.index[i - 1]] = entry
+            orders[str(self.close_df.index[i - 1])] = entry
     
-            if i >= self.close_df.shape[0] or self.close_df.index[i] > self.end_date:
+            if i >= self.close_df.shape[0]:
+                break
+
+            if self.close_df.index[i] > self.end_date:
                 break
     
             section_data = self.close_df.iloc[i - min_data_points:i, :]
@@ -167,9 +171,9 @@ class PCAPtfStatArb:
             for long, short in zip(idx_long, idx_short):
                 long_entry_price = self.open_df.iloc[i, long] * (1 + slippage)
                 short_entry_price = self.open_df.iloc[i, short] * (1 - slippage)
-                entry[long] = {'price': long_entry_price, "size": np.round(cash_value / (max_position * long_entry_price))}
-                entry[short] = {'price': short_entry_price, "size": - np.round(cash_value / (max_position * short_entry_price))}
-                beta += (self.beta_df.iloc[i - 1, long] - self.beta_df.iloc[i - 1, short]) / max_position
+                entry[self.tickers[long]] = {'price': long_entry_price, "size": np.round(cash_value / (max_position * long_entry_price))}
+                entry[self.tickers[short]] = {'price': short_entry_price, "size": - np.round(cash_value / (max_position * short_entry_price))}
+                beta += (self.beta_df.iloc[i - 1, long] - self.beta_df.iloc[i - 1, short]) / (max_position)
     
             
             # Beta Hedge
@@ -192,7 +196,7 @@ class PCAPtfStatArb:
         df.loc[-1] = [0, self.initial_cash, 0]
         df.index = df.index + 1
         df.sort_index(inplace = True)
-        df.index = orders.keys()
+        df.index = pd.to_datetime(list(orders.keys()))
     
         df['benchmark_close'] = self.benchmark_data.Close.loc[df.index]
         df['benchmark_val'] = df.benchmark_close / df.benchmark_close[0] * self.initial_cash
@@ -214,7 +218,7 @@ class PCAPtfStatArb:
         
         orders_json = os.path.join(result_storage, "orders.json")
         with open(orders_json, "w") as f:
-            json.dumps(orders)
+            json.dump(orders, f)
 
         simulation_csv = os.path.join(result_storage, "ptf.csv")
         df.to_csv(simulation_csv, index = True)
@@ -296,7 +300,6 @@ class PCAPtfStatArb:
     
     def run_simulation(self, max_pos, min_datapoints, beta_hedge = False):
         end_cash_value, df, orders = self.simulation(max_pos, min_datapoints, beta_hedge)
-        self.plot_graphs(df, orders)
         df, statistics = self.backtest_statistics(df)
         table = self.create_table(BACKTEST_TABLE_FIELDS)
         statistics = np.array(list(statistics.values()))
@@ -306,6 +309,7 @@ class PCAPtfStatArb:
         print(table)
 
         self.plot_graphs(df, orders)
+        self.store_results(df, orders)
 
     def cartesian(self, arrays, out = None):
         arrays = [np.asarray(x) for x in arrays]
@@ -342,10 +346,10 @@ class PCAPtfStatArb:
         
         optim_res = pd.concat(test_results)
         optim_res[optim_columns] = all_possibilities
-        optim_res['backtest_name'] = optim_res.apply(lambda x: f"Case_{int(x.max_pos)}_{int(x.min_point)}_{x.hedge_choice}", axis = 1)
+        optim_res['backtest_name'] = optim_res.apply(lambda x: f"Case_{int(x.max_pos)}_{int(x.min_points)}_{x.hedge_choice}", axis = 1)
         optim_res.set_index("backtest_name", inplace = True)
-        optim_res.sort_values(by = "ptf_return", inplace = True)
-        return optim_res.drop(column = optim_columns)
+        optim_res.sort_values(by = "ptf_return", ascending = False, inplace = True)
+        return optim_res.drop(columns = optim_columns)
     
     def run_optimize(self):
         optim_res = self.optimize()
@@ -354,12 +358,35 @@ class PCAPtfStatArb:
         print(tabulate(optim_res))
 
 
-        
-        
 
 
 if __name__ == "__main__":
-    start_date = datetime(2022, 1, 1)
-    end_date = datetime(2024, 1, 1)
+    parser = argparse.ArgumentParser(prog = "Script that run backtesting and optimization with PCA Strategy")
+    parser.add_argument("-s", "--start-date", action = "store", default = "20220101", help = "Start date")
+    parser.add_argument("-e", "--end-date", action = "store", default = "20240101", help = "End date")
+    parser.add_argument("-o", "--optimise", action = "store_true", default = False, help = "Optimization or not")
+    parser.add_argument("-b", "--backtest", action = "store_true", default = False, help = "Backtest or not")
+    parser.add_argument("-t", "--tickers", action = "store", default = "", help = "Tickers, SPY Sector ETFs if not defined")
+    parser.add_argument("-m", "--max-pos", action = "store", default = 0, type = int, help = "Max positions if backtest")
+    parser.add_argument("-p", "--min-points", action = "store", default = 0, type = int, help = "Min datapoints for PCA if backtest")
+    parser.add_argument("--hedge", action = "store_true", default = False, help = "Hedge if backtest")
+
+    args = parser.parse_args()
+    start_date = datetime.strptime(args.start_date, "%Y%m%d")
+    end_date = datetime.strptime(args.end_date, "%Y%m%d")
+    if start_date > end_date:
+        start_date, end_date = end_date, start_date
+
+    tickers = SPY_SECTOR_ETF if args.tickers else args.tickers.split(",")
+
     algo = PCAPtfStatArb(SPY_SECTOR_ETF, start_date, end_date)
-    algo.run_optimize()
+    
+    if args.backtest:
+        if (not args.max_pos) and (not args.min_points):
+            print("Please define correct params for max_pos and min_points")
+        algo.run_simulation(args.max_pos, args.min_points, args.hedge)
+    elif args.optimise:
+        algo.run_optimize()
+
+    
+    
