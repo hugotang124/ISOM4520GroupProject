@@ -1,7 +1,6 @@
 # Data-related Imports
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
 import yfinance as yf
 
 # General Imports
@@ -16,19 +15,24 @@ warnings.simplefilter(action = "ignore", category = FutureWarning)
 from sklearn.decomposition import PCA
 import statsmodels.api as sm
 from sklearn.preprocessing import StandardScaler
-from scipy.stats import norm
+from scipy.stats import norm, skew, kurtosis
 
 # Display output
 from prettytable import PrettyTable
+from tabulate import tabulate
+import matplotlib.pyplot as plt
+import seaborn as sns
 import json
 import tqdm
+
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 SPY_SECTOR_ETF = ["XLC", "XLY", "XLP", "XLE", "XLF", "XLV", "XLI", "XLB", "XLRE", "XLK", "XLU"]
 BACKTEST_TABLE_FIELDS = ["Test Name", "Portfolio Return (%)", "Average Return (%)",
-                         "Volatility (%)", "VaR (%)", "MDD(%)",
-                         "Win Rate (%)", "Long Win Rate (%)", "Short Win Rate (%)",
-                         "Alpha (%)", "Beta", "Sharpe Ratio"]
+                         "Volatility (%)", "VaR (%)", "Expected Shortfall (%)" ,
+                         "MDD(%)", "Win Rate (%)", "Long Win Rate (%)", "Short Win Rate (%)",
+                         "Alpha (%)", "Beta", "Skewness", "Kurtosis", "Sharpe Ratio"]
 
 class PCAPtfStatArb:
     
@@ -43,6 +47,7 @@ class PCAPtfStatArb:
         self.get_market_data()
     
     def get_market_data(self):
+        print("Getting market data")
         folder = 'ProjectData'
         if not os.path.exists(folder):
             os.mkdir(folder)
@@ -63,6 +68,9 @@ class PCAPtfStatArb:
             df.index = pd.to_datetime(df.index, utc=True)
             df.index = df.index.tz_convert('US/Eastern')
             holder[ticker] = df
+
+        
+        print("Handling market data")
         
         self.benchmark_data = holder.pop(self.benchmark_sym)
         self.close_df, self.open_df, self.return_df, self.std_returns_df = self.generalize_data(holder)
@@ -84,13 +92,17 @@ class PCAPtfStatArb:
         return close_df, open_df, return_df, std_returns_df
     
     def calculate_beta(self):
+        # Get the beta of each ticker at every moment of time
+
+        print("Calculating individual stock beta")
         self.beta_df = pd.DataFrame() 
         for stock in self.return_df.columns:
             self.beta_df[stock] = self.return_df[stock].rolling(22).cov(self.benchmark_returns) / self.benchmark_returns.rolling(22).var()
         self.beta_df.shift(1)
 
-
     def get_residuals(self, data, N = 1):
+        # Get residuals of the PCA transformed dataset, assume stationarity
+
         pca = PCA(n_components = N)
         pca.fit(data)
         index = pca.components_[0]
@@ -99,24 +111,24 @@ class PCAPtfStatArb:
         return res
 
     def z_score(self, data):
+        # Standardisation of residuals
         scaler = StandardScaler()
         return scaler.fit_transform(data)
     
-    def simulation(self, max_position, min_data_points, beta_hedge = False):
-        '''
-        Simulation function
-    
-        Assume trades will be opened during daily open and closed during daily close
-        '''
+    def simulation(self, max_position, min_data_points, beta_limit = 10, beta_hedge = False):
+        # Simulating trades, assume it will be opened during daily open and closed during daily close
+
         entry = {}
         pnls = []
         betas = []
         dates = []
         orders = {}
+
+        # Assumptions 
         slippage = 0.00025
         commission_fee = 0.005
-        beta_limit = 0.2
-    
+
+        beta_limit = beta_limit / 100
     
         if max_position >= self.close_df.shape[1] / 2:
             print("There's too many positions within the portfolio")
@@ -137,7 +149,7 @@ class PCAPtfStatArb:
                 else:
                     trade_pnl = (price - self.benchmark_data.Close[i - 1]) * size
                 
-                trade_pnl -= commission_fee * abs(size)
+                trade_pnl -= 2 * commission_fee * abs(size)
                 position_info["pnl"] = trade_pnl
                 daily_pnl += trade_pnl
                 
@@ -153,6 +165,8 @@ class PCAPtfStatArb:
                 break
     
             section_data = self.close_df.iloc[i - min_data_points:i, :]
+
+            # Ensure the start point is when all stocks in the basket is available to trade
             if section_data.isna().sum().sum() > 0:
                 continue
     
@@ -165,20 +179,21 @@ class PCAPtfStatArb:
     
             # Opening the position according to open price of current time
             
+            # Filter the stocks to get n largest z-scores and n lowest z-scores
             entry = {}
             idx_long = (np.argsort([zs[j] for j in zs])[:max_position])
             idx_short = (np.argsort([zs[j] for j in zs])[-max_position:])
     
             beta = 0
             
+            # Enter the position
             for long, short in zip(idx_long, idx_short):
                 long_entry_price = self.open_df.iloc[i, long] * (1 + slippage)
                 short_entry_price = self.open_df.iloc[i, short] * (1 - slippage)
                 entry[self.tickers[long]] = {'price': long_entry_price, "size": np.round(cash_value / (max_position * long_entry_price))}
                 entry[self.tickers[short]] = {'price': short_entry_price, "size": - np.round(cash_value / (max_position * short_entry_price))}
-                beta += (self.beta_df.iloc[i - 1, long] - self.beta_df.iloc[i - 1, short]) / (max_position)
+                beta += (self.beta_df.iloc[i - 1, long] - self.beta_df.iloc[i - 1, short]) / (2 * max_position)
     
-            
             # Beta Hedge
             if beta_hedge and abs(beta) > beta_limit:
                 abs_difference = abs(beta) - beta_limit
@@ -200,52 +215,61 @@ class PCAPtfStatArb:
         df.index = df.index + 1
         df.sort_index(inplace = True)
         df.index = pd.to_datetime(list(orders.keys()))
-    
+
+        # Creating columns for evaluation purposes
         df['benchmark_close'] = self.benchmark_data.Close.loc[df.index]
         df['benchmark_val'] = df.benchmark_close / df.benchmark_close[0] * self.initial_cash
         df['ptf_return'] = df.ptf_value.pct_change()
         df['benchmark_return'] = df.benchmark_val.pct_change()
 
-        window = 252
-        roll_max = df.ptf_value.rolling(window, min_periods = 1).max()
-        df['max_drawdown'] = df.ptf_value / roll_max - 1
-        
+        previous_peaks = df.ptf_value.cummax()
+        df['max_drawdown'] = (df.ptf_value - previous_peaks) / previous_peaks
     
         return cash_value, df, orders        
     
     def store_results(self, df, orders, table):
 
+        print("Storing backtest results")
+
         result_storage = "BacktestResults"
         if not os.path.exists(result_storage):
             os.mkdir(result_storage)
         
+        # Summary statistics
         summary = os.path.join(result_storage, "summary.txt")
         with open(summary, "w") as f:
             f.write(table.get_string())
         
+        # Orders in this simulation
         orders_json = os.path.join(result_storage, "orders.json")
         with open(orders_json, "w") as f:
             json.dump(orders, f)
 
+        # Data of portfolio vs benchmark
         simulation_csv = os.path.join(result_storage, "ptf.csv")
         df.to_csv(simulation_csv, index = True)
 
     
-    def plot_graphs(self, df):
+    def plot_graphs(self, df, statistics):
+
+        print("Plotting graphs")
         
         graph_storage = "Graphs"
         if not os.path.exists(graph_storage):
             os.mkdir(graph_storage)
 
         # Equity Curve
-        equity_curve = plt.figure(figsize = (8, 8))
+        equity_curve = plt.figure(figsize = (10, 10))
         plt.plot(df.ptf_value, label = "Strategy")
         plt.plot(df.benchmark_val, label = "Benchmark")
+        plt.title("Equity Curve")
+        plt.ylabel("Value")
+        plt.xlabel("Time")
         plt.legend()
         equity_curve.savefig(os.path.join(graph_storage, "EquityCurveVSBenchmark.png"))
 
         # Portfolio Beta
-        beta_curve = plt.figure(figsize = (8, 8))
+        beta_curve = plt.figure(figsize = (10, 10))
         plt.plot(df.ptf_beta)
         plt.title('Portfolio Beta')
         plt.xlabel("Time")
@@ -253,27 +277,50 @@ class PCAPtfStatArb:
         plt.savefig(os.path.join(graph_storage, "PortfolioBetaGraph.png"))
 
         # Max Drawdown Curve
-        mdd_curve = plt.figure(figsize = (8, 8))
+        mdd_curve = plt.figure(figsize = (10, 10))
         plt.plot(df.max_drawdown)
+        plt.title("Max Drawdown Curve")
         plt.title('Portfolio Max Drawdown')
         plt.xlabel("Time")
-        plt.ylabel("Beta")
+        plt.ylabel("Drawdown")
         plt.savefig(os.path.join(graph_storage, "PortfolioMDDGraph.png"))
+
+        # Returns distribution plot with VaR line
+        ptf_returns = df.ptf_return.dropna()
+        return_dist = plt.figure(figsize = (10, 10))
+        mu = ptf_returns.mean()
+        std = ptf_returns.std()
+        plt.hist(df.ptf_return.dropna(), bins = 50)
+        plt.axvline(statistics['var'], color = 'r', label = "VaR")
+        plt.title("Return Distribution")
+        plt.xlabel("Returns")
+        plt.legend()
+        plt.savefig(os.path.join(graph_storage, "ReturnDistributionGraph.png"))
+
+        # Returns Q-Q plot
+        qq_plot = plt.figure(figsize = (10, 10))
+        sm.qqplot(df.ptf_return.dropna() * 100, line = "45")
+        plt.title("Q-Q Plot of Returns against Normal Distribution")
+        plt.savefig(os.path.join(graph_storage, "ReturnQQPlot.png"))
+
+
 
 
     def backtest_statistics(self, df, orders):
 
-        df_b = df.copy().dropna()
+        ptf_return = (df.ptf_value[-1] - df.ptf_value[0]) / df.ptf_value[0]
 
+        df_b = df.copy().dropna()
         ptf_returns = df_b.ptf_return
-        ptf_return = (df_b.ptf_value[-1] - df_b.ptf_value[0]) / df_b.ptf_value[0]
         avg_return = ptf_returns.mean()
+        
         std_daily_return = ptf_returns.std()
         volatility = std_daily_return * np.sqrt(252)
 
         confidence_level = 0.95
         z_score_var = norm.ppf(confidence_level)
         VaR_percentage = - z_score_var * std_daily_return
+        
 
         benchmark_returns = df_b.benchmark_return
         model = sm.OLS(ptf_returns, sm.add_constant(benchmark_returns)).fit()
@@ -300,17 +347,27 @@ class PCAPtfStatArb:
         short_orders = orders_df[orders_df.direction == -1]
         short_win_rate = short_orders[short_orders.order_return > 0].shape[0] / short_orders.shape[0]
 
+
+        skewness_val = skew(df_b.ptf_return)
+
+        kurtosis_val = kurtosis(df_b.ptf_return)
+
+        expected_shortfall = df_b[df_b.ptf_return < VaR_percentage].ptf_return.mean()
+
         statistics = {
             "ptf_return": ptf_return,
             "avg_return": avg_return,
             "volatility": volatility,
             "var": VaR_percentage,
-            "maxdrawdown": max_drawdown,
+            "expexted_shortfall": expected_shortfall,
+            "max_drawdown": max_drawdown,
             "win_rate": win_rate,
             "long_win_rate": long_win_rate,
             "short_win_rate": short_win_rate,
             "alpha": alpha,
             "beta": beta,
+            "skewness": skewness_val,
+            "kurtosis": kurtosis_val,
             "sharpe": sharpe
         }
         return df, statistics
@@ -321,16 +378,22 @@ class PCAPtfStatArb:
         table.field_names = fields
         return table
     
-    def run_simulation(self, max_pos, min_datapoints, beta_hedge = False):
-        end_cash_value, df, orders = self.simulation(max_pos, min_datapoints, beta_hedge)
+    def run_simulation(self, max_pos, min_datapoints, beta_limit = 10, beta_hedge = False):
+        print(f"Running simulation on max_pos = {max_pos}, min_datapoints = {min_datapoints}, beta_limit = {beta_limit / 100}, beta_hedge = {beta_hedge}")
+        end_cash_value, df, orders = self.simulation(max_pos, min_datapoints, beta_limit, beta_hedge)
         df, statistics = self.backtest_statistics(df, orders)
-        table = self.create_table(BACKTEST_TABLE_FIELDS)
-        statistics = np.array(list(statistics.values()))
-        statistics[:-2] *= 100
-        statistics = np.round(statistics, 3)
-        table.add_row(["Backtest"] + list(statistics))
+        table = self.create_table([f"Case_{max_pos}_{min_datapoints}_{beta_limit}_{beta_hedge}", "Stats"])
+        stats = np.array(list(statistics.values()))
+        stats[:-4] *= 100
+        stats = np.round(stats, 3)
+        for row_name, stat in zip(BACKTEST_TABLE_FIELDS[1:], list(stats)):
+            table.add_row([row_name, stat], divider = True)
+        
+        stats_df = pd.DataFrame(stats, index = BACKTEST_TABLE_FIELDS[1:])
+        stats_df.columns = ['Stats']
+        stats_df.index.name = f"Case_{max_pos}_{min_datapoints}_{beta_hedge}"
 
-        self.plot_graphs(df)
+        self.plot_graphs(df, statistics)
         self.store_results(df, orders, table)
 
     def cartesian(self, arrays, out = None):
@@ -351,34 +414,42 @@ class PCAPtfStatArb:
         return out
     
     # Grid Search Optimization
+
+    test_results = []
+    
     def optimize(self, arrays, optim_columns):
         all_possibilities = self.cartesian(arrays)
-        test_results = []
-        
-        for max_pos, min_point, hedge_choice in tqdm.tqdm(all_possibilities):
-            end_cash_value, final_df, orders = self.simulation(max_pos, min_point, hedge_choice)
-            final_df, statistics = self.backtest_statistics(final_df)
+
+        print("Starting optimisation")
+
+        for possibility in tqdm.tqdm(all_possibilities):
+            end_cash_value, final_df, orders = self.simulation(*possibility)
+            final_df, statistics = self.backtest_statistics(final_df, orders)
             statistics = pd.DataFrame.from_dict(statistics, orient = "index").T
-            test_results.append(statistics)
+            self.test_results.append(statistics)
         
-        optim_res = pd.concat(test_results)
+        print("Finished optimisation")
+        
+        optim_res = pd.concat(self.test_results)
         optim_res[optim_columns] = all_possibilities
-        optim_res['backtest_name'] = optim_res.apply(lambda x: "Case_" + "_".join([str(int(x[column])) for column in optim_columns]), axis = 1)
+        optim_res['backtest_name'] = optim_res.apply(lambda x: "Case_" + "_".join([str(x[column]) for column in optim_columns]), axis = 1)
         optim_res.set_index("backtest_name", inplace = True)
         optim_res.sort_values(by = "sharpe", ascending = False, inplace = True)
         return optim_res.drop(columns = optim_columns)
     
-    def run_optimize(self):
+    def run_optimize(self, hedge = True):
         max_pos_poss = list(range(1, 6))
         min_points_poss = list(range(10, 252, 10))
-        beta_hedge_choices = [True, False]
-        optim_columns = ["max_pos", "min_points", "hedge_choice"]
-        optim_arrays = [max_pos_poss, min_points_poss, beta_hedge_choices]
+        optim_arrays = [max_pos_poss, min_points_poss]
+        optim_columns = ["max_pos", "min_points"]
+        if hedge:
+            beta_limit_choices = list(range(0, 55, 5))
+            optim_arrays.append(beta_limit_choices)
+            optim_columns += ["beta_limit", "hedge"]
 
         optim_res = self.optimize(optim_arrays, optim_columns)
-        # optim_res.to_csv("OptimizationResults.csv", index = True)
+        optim_res.to_csv("OptimizationResults.csv", index = True)
         best_params = optim_res.index[0].split("_")[1:]
-        from tabulate import tabulate
         print(tabulate(optim_res, headers = optim_res.columns))
 
 
@@ -391,7 +462,8 @@ if __name__ == "__main__":
     parser.add_argument("-t", "--tickers", action = "store", default = "", help = "Tickers, SPY Sector ETFs if not defined")
     parser.add_argument("-m", "--max-pos", action = "store", default = 0, type = int, help = "Max positions if backtest")
     parser.add_argument("-p", "--min-points", action = "store", default = 0, type = int, help = "Min datapoints for PCA if backtest")
-    parser.add_argument("--hedge", action = "store_true", default = False, help = "Hedge if backtest")
+    parser.add_argument("--beta-limit", action = "store", default = 0, type = int, help = "Beta limit multiplied by 100 for backtest")
+    parser.add_argument("--hedge", action = "store_true", default = False, help = "Hedge included in backtest or optimisation")
 
     args = parser.parse_args()
     start_date = datetime.strptime(args.start_date, "%Y%m%d")
@@ -404,11 +476,11 @@ if __name__ == "__main__":
     algo = PCAPtfStatArb(SPY_SECTOR_ETF, start_date, end_date)
     
     if args.backtest:
-        if (not args.max_pos) and (not args.min_points):
+        if (args.max_pos <= 0) and (not args.min_points <= 0):
             print("Please define correct params for max_pos and min_points")
-        algo.run_simulation(args.max_pos, args.min_points, args.hedge)
+        algo.run_simulation(args.max_pos, args.min_points, args.beta_limit, args.hedge)
     elif args.optimise:
-        algo.run_optimize()
+        algo.run_optimize(args.hedge)
 
     
     
